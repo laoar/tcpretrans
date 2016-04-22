@@ -1,0 +1,483 @@
+#!/usr/bin/perl
+
+# This tool is derived from the tool wrote by Brendan Gregg.
+# In order to make it easy to use, I did some modification.
+# Currently this tool could run on both CentOS-6 and CentOS-7.
+# Wish it could help you.
+# Feel free to contact me if you find some issue. 
+# 
+# 21-Apr-2016    A new option '-a' to do live trace 
+# 21-Apr-2016    only root can run this script
+# --@yafang
+
+#
+# tcpretrans - show TCP retransmts, with address and other details.
+#              Written using Linux ftrace.
+#
+# This traces TCP retransmits, showing address, port, and TCP state information,
+# and sometimes the PID (although usually not, since retransmits are usually
+# sent by the kernel on timeouts). To keep overhead low, only
+# tcp_retransmit_skb() calls are traced (this does not trace every packet).
+#
+# USAGE: ./tcpretrans [-hlsa]
+#
+# REQUIREMENTS: FTRACE and KPROBE CONFIG, tcp_retransmit_skb() kernel function,
+# and tcp_send_loss_probe() when -l is used. You may have these already have
+# these on recent kernels. And Perl.
+#
+# This was written as a proof of concept for ftrace, for older Linux systems,
+# and without kernel debuginfo. It uses dynamic tracing of tcp_retransmit_skb(),
+# and reads /proc/net/tcp for socket details. Its use of dynamic tracing and
+# CPU registers is an unstable platform-specific workaround, and may require
+# modifications to work on different kernels and platforms. This would be better
+# written using a tracer such as SystemTap, and will likely be rewritten in the
+# future when certain tracing features are added to the Linux kernel.
+#
+# When -l is used, this also uses dynamic tracing of tcp_send_loss_probe() and
+# a register.
+#
+# Currently only IPv4 is supported, on x86_64. If you try this on a different
+# architecture, you'll likely need to adjust the register locations (search
+# for %di).
+#
+# OVERHEAD: The CPU overhead is relative to the rate of TCP retransmits, and is
+# designed to be low as this does not examine every packet. Once per second the
+# /proc/net/tcp file is read, and a buffer of retransmit trace events is
+# retrieved from the kernel and processed.
+#
+# From perf-tools: https://github.com/brendangregg/perf-tools
+#
+# See the tcpretrans(8) man page (in perf-tools) for more info.
+#
+# COPYRIGHT: Copyright (c) 2014 Brendan Gregg.
+#
+#  This program is free software; you can redistribute it and/or
+#  modify it under the terms of the GNU General Public License
+#  as published by the Free Software Foundation; either version 2
+#  of the License, or (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#
+#  You should have received a copy of the GNU General Public License
+#  along with this program; if not, write to the Free Software Foundation,
+#  Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+#
+#  (http://www.gnu.org/copyleft/gpl.html)
+#
+# 28-Jul-2014	Brendan Gregg	Created this.
+
+use strict;
+use warnings;
+use POSIX qw(strftime);
+use Getopt::Long;
+use IO::Pipe;
+use IO::Handle;
+my $tracing = "/sys/kernel/debug/tracing";
+my $flock = "/var/tmp/.ftrace-lock";
+my $interval = 1;
+local $SIG{INT} = \&cleanup;
+local $SIG{QUIT} = \&cleanup;
+local $SIG{TERM} = \&cleanup;
+local $SIG{PIPE} = \&cleanup;
+local $SIG{HUP} = \&cleanup;
+$| = 1;
+
+# check root permission.
+if ($> != 0) {
+    die "ERROR: non-root user!\n"
+}
+
+### options
+my ($help, $stacks, $live, $tlp);
+GetOptions("help|h"   => \$help,
+	   "stacks|s" => \$stacks,
+           "live|a" => \$live,
+	   "tlp|l" => \$tlp)
+or usage();
+usage() if $help;
+
+sub usage {
+	print STDERR "USAGE: tcpretrans [-hlsa]\n";
+	print STDERR "                  -h      # help message\n";
+	print STDERR "                  -l      # trace TCP tail loss probes\n";
+	print STDERR "                  -s      # print stack traces\n";
+        print STDERR "                  -a      # live trace.\n";
+	print STDERR "   eg,\n";
+	print STDERR "       tcpretrans         # trace TCP retransmits\n";
+	exit;
+}
+
+# delete lock and die
+sub ldie {
+	unlink $flock;
+	die @_;
+}
+
+# end tracing (silently) and die
+sub edie {
+	print STDERR "@_\n";
+	close STDOUT;
+	close STDERR;
+	cleanup();
+}
+
+sub writeto {
+	my ($string, $file) = @_;
+	open FILE, ">$file" or return 0;
+	print FILE $string or return 0;
+	close FILE or return 0;
+}
+
+sub appendto {
+	my ($string, $file) = @_;
+	open FILE, ">>$file" or return 0;
+	print FILE $string or return 0;
+	close FILE or return 0;
+}
+
+# kprobe functions
+sub create_kprobe {
+	my ($kname, $kval) = @_;
+	appendto "p:$kname $kval", "kprobe_events" or return 0;
+}
+
+sub enable_kprobe {
+	my ($kname) = @_;
+	writeto "1", "events/kprobes/$kname/enable" or return 0;
+}
+
+sub remove_kprobe {
+	my ($kname) = @_;
+	writeto "0", "events/kprobes/$kname/enable" or return 0;
+	appendto "-:$kname", "kprobe_events" or return 0;
+}
+
+# tcp socket cache
+my %tcp;
+sub cache_tcp {
+	undef %tcp;
+	open(TCP, "/proc/net/tcp") or ldie "ERROR: reading /proc/net/tcp.";
+	while (<TCP>) {
+		next if /^ *sl/;  # ignore the first line, which begins with "sl".
+                # $jf : socket reference count
+                # $sk : location of socket in memory
+		my ($sl, $local_address, $rem_address, $st, $tx_rx, $tr_tm,
+		    $retrnsmt, $uid, $timeout, $inode, $jf, $sk) = split;
+		$sk =~ s/^0x//;
+		$tcp{$sk}{laddr} = $local_address;
+		$tcp{$sk}{raddr} = $rem_address;
+		$tcp{$sk}{state} = $st;
+	}
+	close TCP;
+}
+
+my ($tcp_laddr, $tcp_raddr, $tcp_state, $got);
+sub get_tcp_info {
+        my $retran_skb = $1;
+        open(TCP_LIVE, "/proc/net/tcp") or ldie "ERROR: reading /proc/net/tcp.";
+	while (<TCP_LIVE>) {
+		next if /^ *sl/;  # ignore the first line, which begins with "sl".
+                # $jf : socket reference count
+                # $sk : location of socket in memory
+		my ($sl, $local_address, $rem_address, $st, $tx_rx, $tr_tm,
+		    $retrnsmt, $uid, $timeout, $inode, $jf, $sk) = split;
+		$sk =~ s/^0x//;
+                if ($retran_skb eq $sk) {
+                    $tcp_laddr = $local_address;
+                    $tcp_raddr = $rem_address;
+                    $tcp_state = $st;
+                    close TCP_LIVE;
+                    $got = 1;
+                    return;
+                } 
+	}
+        $got = 0;
+	close TCP_LIVE;
+}
+
+my @tcpstate;
+sub map_tcp_states {
+	push @tcpstate, "NULL";
+	for (<DATA>) {
+		chomp;
+		s/.*TCP_//;
+		s/[, ].*$//;
+		push @tcpstate, $_;
+	}
+}
+
+# /proc/net/tcp hex addr to dotted quad decimal
+sub inet_h2a {
+	my ($haddr) = @_;
+
+	my @addr = ();
+	for my $num ($haddr =~ /(..)(..)(..)(..)/) {
+		unshift @addr, hex($num);
+	}
+	return join(".", @addr);
+}
+
+my $DEBUGFS_FILE = "/sys/kernel/debug/tracing/tracing_on";
+# /sys/kernel/debug/tracing/tracing_enabled only exists in CentOS-6.
+my $ENABLED_FILE = "/sys/kernel/debug/tracing/tracing_enabled";
+my $tracing_on = 0;
+my $tracing_enabled = 0;
+my $debugfs_mount = 0;
+my $enabled_file = 0;
+sub debugfs_enable {
+    my $mount = -e $DEBUGFS_FILE;  # tracing_on exists in both CentOS-6 and CentOS-7. 
+    if ($mount) {
+        $debugfs_mount = 1;
+        open(TRACING_ON, $DEBUGFS_FILE) or die "ERROR: reading ", $DEBUGFS_FILE;
+        $tracing_on = <TRACING_ON>;
+        close(TRACING_ON);
+        if ($tracing_on == 0) {  # ftrace is off 
+            open(TRACING_ON, ">".$DEBUGFS_FILE) or 
+                 die "ERROR: failed to write ", $DEBUGFS_FILE;
+            print TRACING_ON "1";
+            close(TRACING_ON);
+            print "INFO: ftrace on.\n";
+        }
+    } else {  # should mount debugfs 
+        system("mount -t debugfs debugfs /sys/kernel/debug/");
+        if (!(-e $DEBUGFS_FILE)) { # mount failed.
+            exit;
+        }
+        print "INFO: debugfs mounted.\n";
+        $tracing_on = 1;
+        open(TRACING_ON, ">".$DEBUGFS_FILE) or 
+            die "ERROR: failed to write ", $DEBUGFS_FILE;
+        print TRACING_ON "1";
+        close(TRACING_ON);
+    }
+
+    $enabled_file = -e $ENABLED_FILE;
+    if ($enabled_file) {   # CentOS-6, should set it to "1".
+        open(ENABLE, $ENABLED_FILE) or die "ERROR: reading ", $ENABLED_FILE;
+        $tracing_enabled = <ENABLE>;
+        close(ENABLE);
+        if ($tracing_enabled == 0) {
+            open(ENABLE, ">".$ENABLED_FILE) or
+                 die "ERROR: failed to write ", $ENABLED_FILE;
+            print ENABLE "1";
+            close(ENABLE);
+            print "INFO: ftrace enabled.\n";
+        }
+    }
+}
+
+sub debugfs_recover {
+    if ($tracing_on == 0) {
+        open(TRACING_ON, ">".$DEBUGFS_FILE) or 
+            die "ERROR: failed to write ", $DEBUGFS_FILE;
+        print TRACING_ON "0";
+        close(TRACING_ON);
+        print "INFO: ftrace off.\n";
+    }
+
+    if ($enabled_file) {
+        if ($tracing_enabled == 0) {
+            open(ENABLE, ">".$ENABLED_FILE) or 
+               die "ERROR: failed to write ", $ENABLED_FILE;
+            print ENABLE "0";
+            close(ENABLE);
+            print "INFO: ftrace disabled.\n";
+        }
+    }
+ 
+    if ($debugfs_mount == 0) {
+        system("umount /sys/kernel/debug");
+        print "INFO: debugfs umounted.\n";
+    }
+}
+
+debugfs_enable;
+### check permissions
+chdir "$tracing" or die "ERROR: accessing tracing. Kernel has FTRACE?" .
+    "\ndebugfs mounted? (mount -t debugfs debugfs /sys/kernel/debug)";
+
+### ftrace lock
+if (-e $flock) {
+	open FLOCK, $flock; my $fpid = <FLOCK>; chomp $fpid; close FLOCK;
+	die "ERROR: ftrace may be in use by PID $fpid ($flock)";
+}
+writeto "$$", $flock or die "ERROR: unable to write $flock.";
+
+#
+# Setup and begin tracing.
+# Use of ldie() and edie() ensures that if an error is encountered, the
+# kernel is not left in a partially configured state.
+#
+writeto "nop", "current_tracer" or ldie "ERROR: disabling current_tracer.";
+my $kname_rtr = "tcpretrans_tcp_retransmit_skb";
+my $kname_tlp = "tcpretrans_tcp_send_loss_probe";
+create_kprobe $kname_rtr, "tcp_retransmit_skb sk=%di" or
+    ldie "ERROR: creating kprobe for tcp_retransmit_skb().";;
+if ($tlp) {
+	create_kprobe $kname_tlp, "tcp_send_loss_probe sk=%di" or
+	    edie "ERROR: creating kprobe for tcp_send_loss_probe(). " .
+	         "Older kernel version?";
+}
+if ($stacks) {
+	writeto "1", "options/stacktrace" or print STDERR "WARNING: " .
+	    "unable to enable stacktraces.\n";
+}
+enable_kprobe $kname_rtr or edie "ERROR: enabling $kname_rtr probe.";
+if ($tlp) {
+	enable_kprobe $kname_tlp or edie "ERROR: enabling $kname_tlp probe.";
+}
+map_tcp_states();
+
+sub begin_monitor {
+    print "INFO: monitoring the TCP connections...\n";
+    print "      No output means no TCP retransmission\n";    
+    print "      If addr:port is -:-, it means TCP connection is very short.\n";
+    print "      It will print the TCP details once there's retransmission.\n";
+}
+
+begin_monitor;
+
+printf "%-8s %-6s %-20s -- %-20s %-12s\n", "TIME", "PID", "LADDR:LPORT",
+    "RADDR:RPORT", "STATE";
+
+if ($live) {
+    # live trace by using trace_pipe.    
+    my ($laddr, $lport, $raddr, $rport, $state);
+    my $skp_prev;
+    $skp_prev = "";
+    my $pipe = IO::Pipe->new() or edie "ERROR: fail to create pipe.\n";
+    $pipe->reader(qw(cat trace_pipe)) or edie "ERROR: read pipe.\n";
+    while(<$pipe>) {
+        my ($taskpid, $rest) = split ' ', $_, 2;
+        my ($skp_new) = $rest =~ /sk=([0-9a-fx]*)/;
+        next unless defined $skp_new and $skp_new ne "";
+        $skp_new =~ s/^0x//;
+        if ($skp_new ne $skp_prev) {
+            ($laddr, $raddr) = ("-", "-");
+            ($lport, $rport) = ("-", "-");
+            $state = "-";
+            get_tcp_info($skp_new);
+        }
+        my ($task, $pid) = $taskpid =~ /(.*)-(\d+)/;
+        if ($got == 1) {
+            my ($hladdr, $hlport) = split /:/, $tcp_laddr;
+            my ($hraddr, $hrport) = split /:/, $tcp_raddr;
+            $laddr = inet_h2a($hladdr);
+            $raddr = inet_h2a($hraddr);
+            $lport = hex($hlport);
+            $rport = hex($hrport);
+            $state = $tcpstate[hex($tcp_state)];
+        } 
+
+        my $now = strftime "%H:%M:%S", localtime;
+        # L: loss.    R: retransmission.    
+        printf "%-8s %-6s %-20s %s> %-20s %-12s\n", $now, $pid,
+            "$laddr:$lport", $rest =~ /$kname_tlp/ ? "L" : "R",
+            "$raddr:$rport", $state,   
+        $skp_prev = $skp_new;
+    }
+} else {
+    #
+    # Read and print event data. This loop waits one second then reads the buffered
+    # trace data, then caches /proc/net/tcp, then iterates over the buffered trace
+    # data using the cached state. While this minimizes CPU overheads, it only
+    # works because sockets that are retransmitting are usually long lived, and
+    # remain in /proc/net/tcp for at least our sleep interval.
+    #
+    while (1) {
+	sleep $interval;
+
+	# buffer trace data
+	open TPIPE, "trace" or edie "ERROR: opening trace_pipe.";
+	my @trace = ();
+	while (<TPIPE>) {
+		next if /^#/;
+		push @trace, $_;
+	}
+	close TPIPE;
+	writeto "0", "trace" or edie "ERROR: clearing trace";
+
+	# cache /proc/net/tcp state
+	if (scalar @trace) {
+		cache_tcp();
+	}
+
+	# process and print events
+	for (@trace) {
+		if ($stacks && /^ *=>/) {
+			print $_;
+			next;
+		}
+
+		my ($taskpid, $rest) = split ' ', $_, 2;
+		my ($task, $pid) = $taskpid =~ /(.*)-(\d+)/;
+
+		my ($skp) = $rest =~ /sk=([0-9a-fx]*)/;
+		next unless defined $skp and $skp ne "";
+		$skp =~ s/^0x//;
+
+		my ($laddr, $lport, $raddr, $rport, $state);
+		if (defined $tcp{$skp}) {
+			# convert /proc/net/tcp hex to dotted quads
+			my ($hladdr, $hlport) = split /:/, $tcp{$skp}{laddr};
+			my ($hraddr, $hrport) = split /:/, $tcp{$skp}{raddr};
+			$laddr = inet_h2a($hladdr);
+			$raddr = inet_h2a($hraddr);
+			$lport = hex($hlport);
+			$rport = hex($hrport);
+			$state = $tcpstate[hex($tcp{$skp}{state})];
+		} else {
+			# socket closed too quickly
+			($laddr, $raddr) = ("-", "-");
+			($lport, $rport) = ("-", "-");
+			$state = "-";
+		}
+
+		my $now = strftime "%H:%M:%S", localtime;
+                # L: loss.    R: retransmission.    
+		printf "%-8s %-6s %-20s %s> %-20s %-12s\n", $now, $pid,
+		    "$laddr:$lport", $rest =~ /$kname_tlp/ ? "L" : "R",
+		    "$raddr:$rport", $state,
+	}
+  }
+}
+
+### end tracing
+cleanup();
+
+sub cleanup {
+	print "\nEnding tracing...\n";
+	close TPIPE;
+	if ($stacks) {
+		writeto "0", "options/stacktrace" or print STDERR "WARNING: " .
+		    "unable to disable stacktraces.\n";
+	}
+	remove_kprobe $kname_rtr
+	    or print STDERR "ERROR: removing kprobe $kname_rtr\n";
+	if ($tlp) {
+		remove_kprobe $kname_tlp
+		    or print STDERR "ERROR: removing kprobe $kname_tlp\n";
+	}
+	writeto "", "trace";
+	unlink $flock;
+        chdir "/";   # if we needs umount debugfs, we should change the workdir.
+        debugfs_recover;
+	exit;
+}
+
+# from /usr/include/netinet/tcp.h:
+__DATA__
+  TCP_ESTABLISHED = 1,
+  TCP_SYN_SENT,
+  TCP_SYN_RECV,
+  TCP_FIN_WAIT1,
+  TCP_FIN_WAIT2,
+  TCP_TIME_WAIT,
+  TCP_CLOSE,
+  TCP_CLOSE_WAIT,
+  TCP_LAST_ACK,
+  TCP_LISTEN,
+  TCP_CLOSING   /* now a valid state */
